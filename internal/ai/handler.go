@@ -1,5 +1,5 @@
 // Package ai provides endpoints that call Gemini API to analyze
-// Arthur API telemetry data and produce Root Cause Analysis.
+// OTel telemetry data and produce Root Cause Analysis + section insights.
 package ai
 
 import (
@@ -9,31 +9,36 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"observe-platform/internal/config"
 )
 
-const geminiModel = "gemini-2.0-flash"
-const geminiAPIURL = "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel + ":generateContent"
+// ─── Handler ──────────────────────────────────────────────────────────────────
 
 type Handler struct {
-	geminiKey  string
-	arthurBase string
-	jaegerBase string
-	client     *http.Client
+	gemini       config.GeminiConfig
+	arthur       config.ArthurConfig
+	client       *http.Client
+	arthurClient *http.Client
 }
 
-func NewHandler(geminiKey, arthurBase, jaegerBase string) *Handler {
+func NewHandler(gemini config.GeminiConfig, arthur config.ArthurConfig) *Handler {
 	return &Handler{
-		geminiKey:  geminiKey,
-		arthurBase: arthurBase,
-		jaegerBase: jaegerBase,
-		client:     &http.Client{Timeout: 30 * time.Second},
+		gemini:       gemini,
+		arthur:       arthur,
+		client:       &http.Client{Timeout: gemini.Timeout},
+		arthurClient: &http.Client{Timeout: arthur.Timeout},
 	}
 }
 
-// DiagnoseRequest is what Flutter POSTs to trigger AI diagnosis.
+// ─── /api/ai/diagnose ─────────────────────────────────────────────────────────
+
+// DiagnoseRequest is what Flutter POSTs to trigger AI RCA.
 type DiagnoseRequest struct {
 	TraceID     string         `json:"trace_id"`
 	ServiceName string         `json:"service_name"`
@@ -52,7 +57,7 @@ type SpanInfo struct {
 	Status     string  `json:"status"`
 }
 
-// DiagnoseResponse is what Flutter receives.
+// DiagnoseResponse is what Flutter renders in the trace detail panel.
 type DiagnoseResponse struct {
 	ErrorType        string   `json:"error_type"`
 	RootCause        string   `json:"root_cause"`
@@ -62,8 +67,7 @@ type DiagnoseResponse struct {
 	AnalyzedAt       string   `json:"analyzed_at"`
 }
 
-// Diagnose takes trace/log context from Flutter and returns AI RCA.
-// POST /api/ai/diagnose
+// Diagnose — POST /api/ai/diagnose
 func (h *Handler) Diagnose(c *gin.Context) {
 	var req DiagnoseRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -71,14 +75,14 @@ func (h *Handler) Diagnose(c *gin.Context) {
 		return
 	}
 
-	if h.geminiKey == "" {
+	if h.gemini.APIKey == "" {
 		c.JSON(http.StatusOK, DiagnoseResponse{
-			ErrorType:        "Configuration Warning",
-			RootCause:        "GEMINI_API_KEY is not set on the platform backend. Set the env var to enable real AI diagnosis.",
+			ErrorType: "Configuration Warning",
+			RootCause: "GEMINI_API_KEY is not set. Set it in the .env file to enable real AI diagnosis.",
 			AffectedServices: []string{req.ServiceName},
 			Recommendation: []string{
-				"Set GEMINI_API_KEY=your_key when running observe-platform",
-				"Restart the platform backend service",
+				"Set GEMINI_API_KEY=<your_key> in observe-platform/.env",
+				"Restart the platform backend",
 			},
 			ConfidenceScore: 1.0,
 			AnalyzedAt:      time.Now().UTC().Format(time.RFC3339),
@@ -86,78 +90,197 @@ func (h *Handler) Diagnose(c *gin.Context) {
 		return
 	}
 
-	prompt := buildPrompt(req)
-	result, err := h.callGemini(prompt)
+	result, err := h.callGemini(buildDiagnosePrompt(req))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "gemini_api_error", "detail": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gemini_error", "detail": err.Error()})
 		return
 	}
-
 	result.AnalyzedAt = time.Now().UTC().Format(time.RFC3339)
 	c.JSON(http.StatusOK, result)
 }
 
-// SystemSummary fetches Arthur snapshot + recent traces and asks Gemini for a summary.
-// GET /api/ai/summary
-func (h *Handler) SystemSummary(c *gin.Context) {
-	arthurHealth := h.fetchJSON(h.arthurBase + "/health")
-	arthurSnapshot := h.fetchJSON(h.arthurBase + "/market/snapshot")
+// ─── /api/ai/summary ──────────────────────────────────────────────────────────
 
-	if h.geminiKey == "" {
+// SystemSummary — GET /api/ai/summary
+// Fetches Arthur health + snapshot then asks Gemini for a one-liner status.
+func (h *Handler) SystemSummary(c *gin.Context) {
+	arthurHealth := h.fetchJSON(h.arthurURL(h.arthur.HealthPath))
+	arthurSnapshot := h.fetchJSON(h.arthurURL(h.arthur.SnapshotPath))
+
+	if h.gemini.APIKey == "" {
 		c.JSON(http.StatusOK, gin.H{
-			"summary":          "AI summary unavailable — set GEMINI_API_KEY on the platform backend.",
+			"status":           "unknown",
+			"one_liner":        "AI summary unavailable — GEMINI_API_KEY not set.",
+			"key_signals":      []string{},
+			"recommendation":   "Set GEMINI_API_KEY in the platform .env file.",
 			"arthur_reachable": arthurHealth != nil,
 		})
 		return
 	}
 
-	ctx := map[string]any{
+	ctxJSON, _ := json.MarshalIndent(map[string]any{
 		"arthur_health":   arthurHealth,
 		"market_snapshot": arthurSnapshot,
-	}
-	ctxJSON, _ := json.MarshalIndent(ctx, "", "  ")
+	}, "", "  ")
 
-	fullPrompt := fmt.Sprintf(`You are an SRE AI assistant monitoring Arthur, an automated crypto trading backend system.
-Analyze the system context provided and return a JSON object with this exact structure:
+	prompt := fmt.Sprintf(`You are an SRE AI assistant monitoring Arthur, an automated crypto trading backend.
+Analyze the system context and return ONLY a valid JSON object (no markdown, no backticks):
 {
   "status": "healthy|degraded|critical",
-  "one_liner": "brief system status sentence",
+  "one_liner": "one-sentence system status",
   "key_signals": ["signal1", "signal2", "signal3"],
-  "recommendation": "what engineer should do now"
+  "recommendation": "single actionable sentence"
 }
-Return ONLY valid JSON. No markdown, no preamble, no backticks.
 
-Arthur system context:
+System context:
 %s`, string(ctxJSON))
 
-	result, err := h.callGeminiRaw(fullPrompt)
+	raw, err := h.callGeminiRaw(prompt)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "gemini_api_error", "detail": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gemini_error", "detail": err.Error()})
 		return
 	}
 
 	var parsed any
-	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
-		c.JSON(http.StatusOK, gin.H{"summary": result})
+	if json.Unmarshal([]byte(stripFences(raw)), &parsed) == nil {
+		c.JSON(http.StatusOK, parsed)
 		return
 	}
-	c.JSON(http.StatusOK, parsed)
+	c.JSON(http.StatusOK, gin.H{"one_liner": raw, "status": "unknown"})
 }
 
-// ---- Prompt builder ----
+// ─── /api/ai/insight ──────────────────────────────────────────────────────────
 
-func buildPrompt(req DiagnoseRequest) string {
+// InsightRequest is what Flutter POSTs for per-section AI insight.
+type InsightRequest struct {
+	// Section identifies which dashboard panel is asking.
+	// Known values: "service_detail" | "services_list" | "traces" | "dashboard"
+	Section string         `json:"section"`
+	// Context carries whatever the screen has: service name, time range,
+	// aggregated stats, recent error counts, etc.
+	Context map[string]any `json:"context"`
+}
+
+// InsightResponse is rendered as the inline AI card on each screen.
+type InsightResponse struct {
+	Summary        string   `json:"summary"`
+	Severity       string   `json:"severity"` // good | info | warning | critical
+	Findings       []string `json:"findings"`
+	Recommendation string   `json:"recommendation"`
+}
+
+// SectionInsight — POST /api/ai/insight
+// Called by the Flutter dashboard to get contextual AI insight
+// for the currently visible screen section.
+func (h *Handler) SectionInsight(c *gin.Context) {
+	var req InsightRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "detail": err.Error()})
+		return
+	}
+
+	if h.gemini.APIKey == "" {
+		c.JSON(http.StatusOK, InsightResponse{
+			Summary:        "AI insights disabled — set GEMINI_API_KEY in the platform backend.",
+			Severity:       "info",
+			Findings:       []string{},
+			Recommendation: "Configure GEMINI_API_KEY in observe-platform/.env and restart.",
+		})
+		return
+	}
+
+	// Optionally enrich context with live Arthur data for the dashboard section
+	enriched := h.enrichContext(req.Section, req.Context)
+	ctxJSON, _ := json.MarshalIndent(enriched, "", "  ")
+
+	prompt := buildInsightPrompt(req.Section, string(ctxJSON))
+
+	raw, err := h.callGeminiRaw(prompt)
+	if err != nil {
+		// Return a graceful fallback instead of an error so the chart UI stays clean
+		c.JSON(http.StatusOK, InsightResponse{
+			Summary:        "AI analysis temporarily unavailable.",
+			Severity:       "info",
+			Findings:       []string{},
+			Recommendation: "Check GEMINI_API_KEY and platform logs.",
+		})
+		return
+	}
+
+	cleaned := stripFences(raw)
+	var result InsightResponse
+	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		// Gemini returned plain text instead of JSON — wrap it gracefully
+		c.JSON(http.StatusOK, InsightResponse{
+			Summary:        cleaned,
+			Severity:       "info",
+			Findings:       []string{},
+			Recommendation: "",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// enrichContext optionally fetches extra live data from Arthur to
+// make the insight prompt richer without Flutter having to send it.
+func (h *Handler) enrichContext(section string, ctx map[string]any) map[string]any {
+	enriched := make(map[string]any)
+	for k, v := range ctx {
+		enriched[k] = v
+	}
+	switch section {
+	case "dashboard":
+		enriched["arthur_health"] = h.fetchJSON(h.arthurURL(h.arthur.HealthPath))
+		enriched["market_snapshot"] = h.fetchJSON(h.arthurURL(h.arthur.SnapshotPath))
+	case "service_detail":
+		// Forward market snapshot for correlation (trading load → service load)
+		enriched["market_snapshot"] = h.fetchJSON(h.arthurURL(h.arthur.SnapshotPath))
+	}
+	return enriched
+}
+
+// buildInsightPrompt returns a section-specific Gemini prompt.
+func buildInsightPrompt(section, ctxJSON string) string {
+	descriptions := map[string]string{
+		"service_detail":  "a service detail page showing latency (p50/p95/p99), error rate, and throughput timeseries charts",
+		"services_list":   "a services overview page with RED metrics (Rate, Errors, Duration) for each microservice",
+		"traces":          "a distributed tracing list page showing recent OTel spans and error traces",
+		"dashboard":       "the main observability dashboard with overall system health, active services, and recent errors",
+	}
+	desc := descriptions[section]
+	if desc == "" {
+		desc = "an observability dashboard section"
+	}
+
+	return fmt.Sprintf(`You are an SRE AI assistant. The engineer is viewing %s.
+
+Analyze the data below and return ONLY a valid JSON object (no markdown, no backticks):
+{
+  "summary": "1-2 sentence main observation referencing specific numbers from the data",
+  "severity": "good|info|warning|critical",
+  "findings": ["specific finding with number", "second finding", "third finding"],
+  "recommendation": "single most important actionable step right now"
+}
+
+Dashboard section data:
+%s`, desc, ctxJSON)
+}
+
+// ─── Prompt builders ──────────────────────────────────────────────────────────
+
+func buildDiagnosePrompt(req DiagnoseRequest) string {
 	spansJSON, _ := json.MarshalIndent(req.Spans, "", "  ")
 	extraJSON, _ := json.MarshalIndent(req.ExtraCtx, "", "  ")
-	return fmt.Sprintf(`You are a senior backend engineer and SRE expert specializing in distributed systems observability and root cause analysis for automated trading systems.
+	return fmt.Sprintf(`You are a senior backend engineer and SRE expert in distributed systems observability.
 
-Analyze this backend error from Arthur API (automated crypto trading system):
+Analyze this backend error:
 
-SERVICE: %s
+SERVICE:   %s
 OPERATION: %s
-STATUS: %s
-DURATION: %.2fms
-TRACE ID: %s
+STATUS:    %s
+DURATION:  %.2f ms
+TRACE ID:  %s
 
 LOG MESSAGE:
 %s
@@ -168,19 +291,19 @@ TRACE SPANS:
 EXTRA CONTEXT:
 %s
 
-Return ONLY a valid JSON object with this exact structure (no markdown, no backticks, no preamble):
+Return ONLY a valid JSON object (no markdown, no backticks, no preamble):
 {
-  "error_type": "string — short error classification",
-  "root_cause": "string — detailed explanation of what went wrong",
-  "affected_services": ["list", "of", "services"],
+  "error_type": "short error classification",
+  "root_cause": "detailed explanation of what went wrong and why",
+  "affected_services": ["service1", "service2"],
   "recommendation": ["step 1", "step 2", "step 3"],
-  "confidence_score": 0.0 to 1.0
+  "confidence_score": 0.0
 }`,
 		req.ServiceName, req.Operation, req.Status, req.DurationMs, req.TraceID,
 		req.LogMessage, string(spansJSON), string(extraJSON))
 }
 
-// ---- Gemini API structs ----
+// ─── Gemini API ───────────────────────────────────────────────────────────────
 
 type geminiRequest struct {
 	Contents         []geminiContent        `json:"contents"`
@@ -214,51 +337,40 @@ type geminiResponse struct {
 	} `json:"error,omitempty"`
 }
 
-// ---- Gemini API call ----
-
-func (h *Handler) callGemini(userPrompt string) (*DiagnoseResponse, error) {
-	raw, err := h.callGeminiRaw(userPrompt)
+func (h *Handler) callGemini(prompt string) (*DiagnoseResponse, error) {
+	raw, err := h.callGeminiRaw(prompt)
 	if err != nil {
 		return nil, err
 	}
-
-	// Strip markdown fences if Gemini wraps with ```json
-	cleaned := raw
-	if len(cleaned) > 7 && cleaned[:7] == "```json" {
-		cleaned = cleaned[7:]
-	}
-	if len(cleaned) > 3 && cleaned[len(cleaned)-3:] == "```" {
-		cleaned = cleaned[:len(cleaned)-3]
-	}
-
+	cleaned := stripFences(raw)
 	var result DiagnoseResponse
 	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
-		result = DiagnoseResponse{
+		return &DiagnoseResponse{
 			ErrorType:        "Parse Error",
 			RootCause:        raw,
 			AffectedServices: []string{"unknown"},
-			Recommendation:   []string{"Check Gemini API response format"},
+			Recommendation:   []string{"Check Gemini API response format in platform logs"},
 			ConfidenceScore:  0.5,
-		}
+		}, nil
 	}
 	return &result, nil
 }
 
 func (h *Handler) callGeminiRaw(prompt string) (string, error) {
-	reqBody := geminiRequest{
-		Contents: []geminiContent{
-			{Parts: []geminiPart{{Text: prompt}}},
-		},
+	body, _ := json.Marshal(geminiRequest{
+		Contents: []geminiContent{{Parts: []geminiPart{{Text: prompt}}}},
 		GenerationConfig: geminiGenerationConfig{
-			Temperature:     0.1,
-			MaxOutputTokens: 1000,
+			Temperature:     h.gemini.Temperature,
+			MaxOutputTokens: h.gemini.MaxOutputTokens,
 		},
+	})
+
+	reqURL, err := h.geminiURL()
+	if err != nil {
+		return "", err
 	}
 
-	bodyBytes, _ := json.Marshal(reqBody)
-
-	url := fmt.Sprintf("%s?key=%s", geminiAPIURL, h.geminiKey)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest("POST", reqURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -266,25 +378,20 @@ func (h *Handler) callGeminiRaw(prompt string) (string, error) {
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("gemini http error: %w", err)
+		return "", fmt.Errorf("gemini http: %w", err)
 	}
 	defer resp.Body.Close()
-
-	// respBytes, _ := io.ReadAll(resp.Body)
-	// if resp.StatusCode != http.StatusOK {
-	// 	return "", fmt.Errorf("gemini API %d: %s", resp.StatusCode, string(respBytes))
-	// }
 
 	respBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[Gemini ERROR] status=%d body=%s", resp.StatusCode, string(respBytes))
 		return "", fmt.Errorf("gemini API %d: %s", resp.StatusCode, string(respBytes))
 	}
-	log.Printf("[Gemini OK] status=%d response_len=%d", resp.StatusCode, len(respBytes))
+	log.Printf("[Gemini OK] status=%d len=%d", resp.StatusCode, len(respBytes))
 
 	var gr geminiResponse
 	if err := json.Unmarshal(respBytes, &gr); err != nil {
-		return "", fmt.Errorf("gemini response parse: %w", err)
+		return "", fmt.Errorf("gemini parse: %w", err)
 	}
 	if gr.Error != nil {
 		return "", fmt.Errorf("gemini error %d: %s", gr.Error.Code, gr.Error.Message)
@@ -295,8 +402,23 @@ func (h *Handler) callGeminiRaw(prompt string) (string, error) {
 	return gr.Candidates[0].Content.Parts[0].Text, nil
 }
 
-func (h *Handler) fetchJSON(url string) any {
-	resp, err := h.client.Get(url)
+func (h *Handler) geminiURL() (string, error) {
+	ep, err := url.Parse(h.gemini.APIURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid GEMINI_API_URL: %w", err)
+	}
+	q := ep.Query()
+	q.Set("key", h.gemini.APIKey)
+	ep.RawQuery = q.Encode()
+	return ep.String(), nil
+}
+
+func (h *Handler) arthurURL(path string) string {
+	return fmt.Sprintf("%s%s", h.arthur.BaseURL, path)
+}
+
+func (h *Handler) fetchJSON(rawURL string) any {
+	resp, err := h.arthurClient.Get(rawURL)
 	if err != nil {
 		return nil
 	}
@@ -304,4 +426,16 @@ func (h *Handler) fetchJSON(url string) any {
 	var result any
 	json.NewDecoder(resp.Body).Decode(&result)
 	return result
+}
+
+// stripFences removes ```json / ``` markdown wrapping that Gemini sometimes adds.
+func stripFences(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```json") {
+		s = strings.TrimPrefix(s, "```json")
+	} else if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```")
+	}
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
 }
