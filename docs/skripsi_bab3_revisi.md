@@ -868,3 +868,390 @@ AI Agent dinyatakan **BERHASIL (PASS)** untuk satu skenario apabila memenuhi **k
 **Confidence Score** diharapkan berada pada rentang **0.6 – 1.0** untuk skenario yang berhasil diidentifikasi. *Score* di bawah 0.6 menandakan AI tidak yakin dengan diagnosis yang diberikan.
 
 Kolom **"Hasil Aktual"** dan **"Status"** pada Tabel 3.8 akan diisi pada Bab 4 setelah pengujian dilaksanakan dengan nilai `PASS` atau `FAIL`.
+
+
+### 3.4.8 Deployment Diagram
+
+*Deployment Diagram* menggambarkan distribusi fisik komponen pada infrastruktur saat sistem dijalankan.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    DEPLOYMENT ARCHITECTURE                            │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────┐       ┌─────────────────────────────────┐
+│   <<device>>               │       │   <<device>>                    │
+│   Engineer's Mobile Phone  │       │   Local Development Server      │
+│   (Android API ≥33)        │       │   (Linux/macOS, Docker)         │
+├────────────────────────────┤       ├─────────────────────────────────┤
+│  ┌──────────────────────┐  │       │  ┌────────────────────────────┐ │
+│  │ <<artifact>>         │  │       │  │ <<container>>              │ │
+│  │  observe_flutter.apk │  │       │  │  arthur-api:latest         │ │
+│  │  (Flutter app)       │  │       │  │  Port: 8420                │ │
+│  │                      │  │       │  └────────────────────────────┘ │
+│  │  - Dashboard         │  │       │  ┌────────────────────────────┐ │
+│  │  - Traces            │◄─┼───────┼──┤ <<container>>              │ │
+│  │  - AI Diagnosis      │  │ HTTPS │  │  observe-system:latest     │ │
+│  │  - Market            │  │ JSON  │  │  Port: 8090                │ │
+│  └──────────────────────┘  │       │  │  - Auth Middleware          │ │
+└────────────────────────────┘       │  │  - Handler modules          │ │
+                                      │  │  - Volume: api_keys.json    │ │
+                                      │  └────────────┬───────────────┘ │
+                                      │               │ gRPC :4317      │
+                                      │               ▼                  │
+                                      │  ┌────────────────────────────┐ │
+                                      │  │ <<container>>              │ │
+                                      │  │  otel-collector:latest     │ │
+                                      │  │  Port: 4317 (gRPC OTLP)    │ │
+                                      │  └────────────┬───────────────┘ │
+                                      │               │ OTLP            │
+                                      │               ▼                  │
+                                      │  ┌────────────────────────────┐ │
+                                      │  │ <<container>>              │ │
+                                      │  │  jaeger-all-in-one:latest  │ │
+                                      │  │  Port: 16686 (Query UI)    │ │
+                                      │  └────────────────────────────┘ │
+                                      └────────────────┬─────────────────┘
+                                                       │ HTTPS
+                                                       ▼
+                                      ┌─────────────────────────────────┐
+                                      │   <<cloud>>                     │
+                                      │   Google Cloud Platform         │
+                                      ├─────────────────────────────────┤
+                                      │  Gemini 2.0 Flash API           │
+                                      │  generativelanguage.            │
+                                      │  googleapis.com                 │
+                                      └─────────────────────────────────┘
+```
+
+**Gambar 3.13** Deployment Diagram Platform Observability
+
+**Tabel 3.9 Spesifikasi Deployment**
+
+| Node | Tipe | Konten | Persyaratan |
+|---|---|---|---|
+| Mobile Phone | Device | observe_flutter.apk | Android ≥ API 33, RAM ≥ 2GB |
+| Development Server | Device | 4 Docker container | OS Linux/macOS, RAM ≥ 8GB |
+| Google Cloud | Cloud Service | Gemini 2.0 Flash API | Internet connection, API key valid |
+
+
+### 3.4.9 Spesifikasi API Endpoint
+
+API yang disediakan oleh Observe-System mengikuti prinsip RESTful dengan format JSON.
+
+**Tabel 3.10 Spesifikasi API Endpoint Observe-System**
+
+| Method | Endpoint | Auth | Deskripsi |
+|---|---|---|---|
+| GET | /health | Public | Health check |
+| POST | /admin/keys | Admin Secret | Buat API key baru |
+| GET | /admin/keys | Admin Secret | List API key (masked) |
+| POST | /admin/keys/revoke | Admin Secret | Revoke API key |
+| DELETE | /admin/keys | Admin Secret | Hapus API key |
+| GET | /api/auth/verify | API Key | Validasi API key |
+| GET | /api/arthur/health | API Key | Proxy Arthur health |
+| GET | /api/arthur/snapshot | API Key | Market snapshot dari Arthur |
+| GET | /api/arthur/alerts | API Key | Market alerts |
+| GET | /api/arthur/performance | API Key | Trade performance |
+| GET | /api/traces | API Key | List traces |
+| GET | /api/traces/:traceID | API Key | Detail satu trace |
+| GET | /api/metrics/services | API Key | RED metrics per service |
+| GET | /api/metrics/service/:name | API Key | Timeseries per service |
+| **POST** | **/api/ai/diagnose** | **API Key** | **AI diagnosis trace (UTAMA)** |
+| GET | /api/ai/summary | API Key | AI system summary |
+| POST | /api/ai/insight | API Key | Per-section AI insight |
+
+**Detail Schema Request/Response untuk Endpoint Diagnose:**
+
+```json
+// REQUEST: POST /api/ai/diagnose
+{
+  "trace_id":     "abc123def456",
+  "service_name": "arthur-api",
+  "operation":    "GET /market/alerts",
+  "status":       "error",
+  "duration_ms":  5300.5,
+  "spans": [
+    {
+      "span_id":     "s004",
+      "operation":   "GET /market/alerts",
+      "duration_ms": 5300,
+      "status":      "error"
+    },
+    {
+      "span_id":     "s005",
+      "operation":   "hyperliquid.FetchFunding",
+      "duration_ms": 5290,
+      "status":      "error"
+    }
+  ],
+  "log_message": "Error trace from Arthur API",
+  "extra_ctx": {}
+}
+
+// RESPONSE: HTTP 200 OK
+{
+  "error_type":        "External Service Timeout",
+  "root_cause":        "Upstream Hyperliquid API connection timed out after 5290ms during funding rate fetch operation",
+  "affected_services": ["arthur-api", "hyperliquid-fetcher"],
+  "recommendation": [
+    "Implement circuit breaker pattern with 3000ms timeout",
+    "Add retry with exponential backoff (max 3 attempts)",
+    "Configure fallback to cached data when upstream is slow"
+  ],
+  "confidence_score": 0.87,
+  "analyzed_at":      "2024-05-25T12:35:18Z"
+}
+```
+
+**Gambar 3.14** Schema Request/Response Endpoint AI Diagnose
+
+
+### 3.4.10 Skema Basis Data (DDL)
+
+Untuk migrasi ke production-grade database (PostgreSQL), skema DDL dirancang sebagai berikut. Pada implementasi prototype, skema disederhanakan menjadi in-memory dan JSON file.
+
+```sql
+-- ===================================================================
+-- TABEL 1: api_keys
+-- ===================================================================
+CREATE TABLE api_keys (
+    key             VARCHAR(64)  PRIMARY KEY,
+    name            VARCHAR(100) NOT NULL,
+    description     TEXT,
+    arthur_url      VARCHAR(255) NOT NULL,
+    jaeger_url      VARCHAR(255) NOT NULL,
+    created_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
+    last_used_at    TIMESTAMP,
+    revoked         BOOLEAN      NOT NULL DEFAULT FALSE
+);
+CREATE INDEX idx_api_keys_revoked ON api_keys(revoked);
+
+-- ===================================================================
+-- TABEL 2: services
+-- ===================================================================
+CREATE TABLE services (
+    service_id      UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    service_name    VARCHAR(100) NOT NULL UNIQUE,
+    environment     VARCHAR(20)  NOT NULL DEFAULT 'production',
+    last_seen       TIMESTAMP    NOT NULL DEFAULT NOW(),
+    instrumented    BOOLEAN      NOT NULL DEFAULT TRUE
+);
+CREATE INDEX idx_services_name ON services(service_name);
+
+-- ===================================================================
+-- TABEL 3: trace_cache (di-partisi per hari pada production)
+-- ===================================================================
+CREATE TABLE trace_cache (
+    trace_id        VARCHAR(64)  PRIMARY KEY,
+    service_id      UUID         NOT NULL REFERENCES services(service_id),
+    operation       VARCHAR(255) NOT NULL,
+    status          VARCHAR(10)  NOT NULL CHECK (status IN ('ok','error','warn')),
+    duration_ms     FLOAT        NOT NULL,
+    timestamp       TIMESTAMP    NOT NULL,
+    spans           JSONB        NOT NULL,
+    log_message     TEXT,
+    cached_at       TIMESTAMP    NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (timestamp);
+
+CREATE INDEX idx_trace_service     ON trace_cache(service_id);
+CREATE INDEX idx_trace_status      ON trace_cache(status);
+CREATE INDEX idx_trace_timestamp   ON trace_cache(timestamp DESC);
+
+-- ===================================================================
+-- TABEL 4: ai_diagnoses
+-- ===================================================================
+CREATE TABLE ai_diagnoses (
+    diagnosis_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    trace_id            VARCHAR(64)  NOT NULL REFERENCES trace_cache(trace_id),
+    error_type          VARCHAR(100) NOT NULL,
+    root_cause          TEXT         NOT NULL,
+    affected_services   JSONB        NOT NULL,
+    recommendation      JSONB        NOT NULL,
+    confidence_score    FLOAT        NOT NULL CHECK (confidence_score BETWEEN 0 AND 1),
+    analyzed_at         TIMESTAMP    NOT NULL DEFAULT NOW(),
+    llm_model           VARCHAR(50)  NOT NULL DEFAULT 'gemini-2.0-flash',
+    UNIQUE(trace_id, llm_model)
+);
+CREATE INDEX idx_diag_trace      ON ai_diagnoses(trace_id);
+CREATE INDEX idx_diag_error_type ON ai_diagnoses(error_type);
+CREATE INDEX idx_diag_analyzed   ON ai_diagnoses(analyzed_at DESC);
+```
+
+**Gambar 3.15** Skema DDL PostgreSQL untuk Production Deployment
+
+
+### 3.4.11 State Diagram Trace Lifecycle
+
+State Diagram menggambarkan transisi state dari sebuah trace sejak masuk ke sistem hingga selesai didiagnosis oleh AI.
+
+```
+                        ┌─────────────────┐
+                        │   ● START       │
+                        │   (trace masuk) │
+                        └────────┬────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │  COLLECTED      │
+                        │  (di Jaeger)    │
+                        └────────┬────────┘
+                                 │ user opens app
+                                 ▼
+                        ┌─────────────────┐
+                        │  LISTED         │
+                        │  (in mobile UI) │
+                        └────────┬────────┘
+                                 │
+                            tap on trace
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │  VIEWED         │
+                        │  (detail spans) │
+                        └────────┬────────┘
+                                 │ if status==error
+                                 │ AND tap "Diagnose AI"
+                                 ▼
+                        ┌─────────────────┐
+                        │  REQUESTED      │
+                        │  (sent to API)  │
+                        └────────┬────────┘
+                                 │
+                            ┌────┴────┐
+                            ▼         ▼
+                ┌─────────────┐  ┌──────────────┐
+                │ AUTH_FAILED │  │ AUTHENTICATED│
+                │  (401)      │  │              │
+                └─────┬───────┘  └──────┬───────┘
+                      │                  │
+                      │                  ▼
+                      │          ┌──────────────┐
+                      │          │  ANALYZING   │
+                      │          │  (Gemini in  │
+                      │          │   progress)  │
+                      │          └──────┬───────┘
+                      │                  │
+                      │              ┌───┴───┐
+                      │              ▼       ▼
+                      │      ┌────────┐ ┌───────────┐
+                      │      │TIMEOUT │ │ DIAGNOSED │
+                      │      │ (>30s) │ │ (success) │
+                      │      └───┬────┘ └─────┬─────┘
+                      │          │            │
+                      ▼          ▼            ▼
+              ┌────────────────────────────────────┐
+              │            DISPLAYED               │
+              │  (engineer reads result on UI)     │
+              └─────────────────┬──────────────────┘
+                                │
+                                ▼
+                        ┌─────────────────┐
+                        │   ● END         │
+                        │  (engineer      │
+                        │   applies fix)  │
+                        └─────────────────┘
+```
+
+**Gambar 3.16** State Diagram Trace Lifecycle dari Collection hingga Diagnosis
+
+
+### 3.5.5 Detail Test Case per Skenario UAT
+
+Setiap skenario UAT pada Tabel 3.8 dijabarkan menjadi test case detail dengan test ID, precondition, test step, dan expected result.
+
+**Tabel 3.11 Detail Test Case TC-01 (External Service Timeout)**
+
+| Field | Detail |
+|---|---|
+| Test ID | TC-01 |
+| Skenario | External Service Timeout |
+| Precondition | Arthur API running, OTel Collector aktif, Jaeger reachable, Mobile app login dengan API key valid |
+| Test Step | 1. Hentikan layanan Bybit API (atau set firewall block)<br>2. Trigger request GET /market/snapshot pada Arthur API<br>3. Tunggu hingga trace muncul di Jaeger (max 1 menit)<br>4. Buka mobile app, tab Traces<br>5. Pilih trace dengan status error<br>6. Tap tombol "Diagnose AI"<br>7. Tunggu hasil diagnosis muncul |
+| Expected Result | a. AI mengembalikan error_type mengandung kata "timeout" atau "External Service"<br>b. root_cause menyebutkan "Bybit" atau "upstream service"<br>c. recommendation mengandung minimal 1 dari: "circuit breaker", "retry", "timeout"<br>d. confidence_score >= 0.6<br>e. Response time <= 30 detik |
+| Pass Criteria | a, b, c, d, e semua terpenuhi |
+
+**Tabel 3.12 Detail Test Case TC-02 (HTTP 500 Internal Server Error)**
+
+| Field | Detail |
+|---|---|
+| Test ID | TC-02 |
+| Skenario | Nil Pointer / HTTP 500 |
+| Precondition | Sama seperti TC-01 |
+| Test Step | 1. Modifikasi handler /market/alerts untuk memicu nil pointer<br>2. Trigger request GET /market/alerts<br>3. Verifikasi trace berstatus error di Jaeger<br>4. Mobile app, tab Traces, pilih trace tersebut<br>5. Tap "Diagnose AI" |
+| Expected Result | a. error_type mengandung "Nil Pointer", "Null Reference", atau "Internal Server Error"<br>b. root_cause mengidentifikasi operation yang gagal<br>c. recommendation mengandung "null check" atau "defensive programming"<br>d. confidence_score >= 0.6 |
+| Pass Criteria | a, b, c, d semua terpenuhi |
+
+**Tabel 3.13 Detail Test Case TC-03 (High Latency)**
+
+| Field | Detail |
+|---|---|
+| Test ID | TC-03 |
+| Skenario | High Latency / Slow Response |
+| Precondition | Sama seperti TC-01 |
+| Test Step | 1. Inject time.Sleep(3 second) di handler /market/snapshot<br>2. Pastikan minimal 4 span sequential ada dalam trace<br>3. Trigger request<br>4. Mobile app, Diagnose AI |
+| Expected Result | a. error_type mengandung "Latency", "Performance", atau "Slow Response"<br>b. root_cause mengidentifikasi span dengan durasi tertinggi<br>c. recommendation mengandung "caching", "parallel", atau "optimize"<br>d. confidence_score >= 0.6 |
+| Pass Criteria | a, b, c, d semua terpenuhi |
+
+**Tabel 3.14 Detail Test Case TC-04 (Cascading Failure)**
+
+| Field | Detail |
+|---|---|
+| Test ID | TC-04 |
+| Skenario | Cascading Service Failure |
+| Precondition | Sama seperti TC-01 |
+| Test Step | 1. Putuskan koneksi Bybit (parent dependency)<br>2. Trigger /market/snapshot (yang juga memanggil indicator computation)<br>3. Verifikasi minimal 3 span error dalam trace<br>4. Diagnose AI |
+| Expected Result | a. error_type mengandung "Cascading" atau "Chain Failure"<br>b. root_cause mengidentifikasi span pertama (root) sebagai sumber<br>c. affected_services berisi minimal 2 service<br>d. recommendation mengandung "bulkhead", "isolation", atau "graceful degradation" |
+| Pass Criteria | a, b, c, d semua terpenuhi |
+
+**Tabel 3.15 Detail Test Case TC-05 (Data Source Unavailability)**
+
+| Field | Detail |
+|---|---|
+| Test ID | TC-05 |
+| Skenario | Data Source Unavailability |
+| Precondition | Sama seperti TC-01 |
+| Test Step | 1. Set host CryptoPanic API ke unreachable<br>2. Trigger /market/news<br>3. Verifikasi span error pada news fetcher<br>4. Diagnose AI |
+| Expected Result | a. error_type mengandung "Dependency", "Unavailable", atau "Connection"<br>b. root_cause menyebutkan API pihak ketiga<br>c. recommendation mengandung "fallback", "alternative source", atau "cache" |
+| Pass Criteria | a, b, c semua terpenuhi |
+
+**Tabel 3.16 Detail Test Case TC-06 (Rate Limiting)**
+
+| Field | Detail |
+|---|---|
+| Test ID | TC-06 |
+| Skenario | Rate Limiting / Throttling |
+| Precondition | Sama seperti TC-01 |
+| Test Step | 1. Trigger 50 rapid request ke /market/snapshot dalam 1 menit<br>2. Verifikasi pola latency bertahap (87ms, 245ms, 890ms, 2100ms)<br>3. Diagnose AI pada trace dengan latency tinggi |
+| Expected Result | a. error_type mengandung "Rate Limit", "Throttling", atau "Quota"<br>b. root_cause mengidentifikasi pola peningkatan latency<br>c. recommendation mengandung "batching", "rate limiter", atau "caching" |
+| Pass Criteria | a, b, c semua terpenuhi |
+
+**Tabel 3.17 Detail Test Case TC-07 (Configuration Error)**
+
+| Field | Detail |
+|---|---|
+| Test ID | TC-07 |
+| Skenario | Configuration Error |
+| Precondition | Sama seperti TC-01 |
+| Test Step | 1. Hapus environment variable GEMINI_API_KEY dari Observe-System<br>2. Restart Observe-System<br>3. Mobile app, Diagnose AI<br>4. Verifikasi response berisi error config |
+| Expected Result | a. error_type mengandung "Configuration" atau "Environment"<br>b. root_cause menyebutkan variable yang missing<br>c. recommendation mengandung "validate at startup" atau "fail-fast" |
+| Pass Criteria | a, b, c semua terpenuhi |
+
+---
+
+## 3.6 Analisis Risiko dan Mitigasi
+
+Sebagai bagian dari perencanaan, berikut analisis risiko teknis yang dapat mempengaruhi implementasi serta strategi mitigasinya.
+
+**Tabel 3.18 Risiko Teknis dan Strategi Mitigasi**
+
+| ID | Kategori Risiko | Deskripsi | Probabilitas | Dampak | Strategi Mitigasi |
+|---|---|---|---|---|---|
+| R-01 | External Dependency | Gemini API down atau breaking change | Rendah | Tinggi | Graceful fallback dengan pesan informatif; tetap tampilkan trace data |
+| R-02 | Performance | Response Gemini melebihi 30 detik | Sedang | Sedang | Timeout 30s di HTTP client; UI menampilkan retry button |
+| R-03 | Cost | Penggunaan Gemini API melebihi quota free tier | Sedang | Sedang | Cache hasil diagnosis berdasarkan trace_id; rate limiting |
+| R-04 | Security | API key bocor pada mobile binary | Sedang | Tinggi | API key di-scope per pengguna; mekanisme revoke; future: OAuth2 |
+| R-05 | Data Quality | Trace dari OTel kurang detail (missing tags) | Tinggi | Sedang | Validasi span attributes saat preprocessing; minimum required fields |
+| R-06 | Reliability | Jaeger crash, trace data hilang | Rendah | Tinggi | Mock data fallback; trace cache di Observe-System; persistent storage |
+| R-07 | LLM Hallucination | AI memberikan diagnosis tidak akurat | Sedang | Sedang | Confidence score threshold 0.6; engineer tetap memvalidasi sebelum apply fix |
+| R-08 | Compatibility | Flutter app tidak kompatibel dengan Android lama | Rendah | Rendah | Minimum API 33; testing pada multiple device |
